@@ -1,0 +1,34 @@
+# aqua’s shifts · Guild handbook
+
+**Playing regularly?** Use `/sign_up`, choose DSG or FH, pick your time, then press **Join as main** for a seat or **Join as sub** to be called when someone needs help. Choose **Join this shift only** for a one-off signup. Regular signups repeat daily. Anyone in the server can sign up without a mod or map role.
+
+**Free to grind right now?** Use `/lf`. Enter how many hours you have from now and an optional note like “1.5 hours, prefer top left.” Your DSG and FH roles tell the bot which maps to contact you about. Ask a mod for the relevant role if you need one. You can edit your availability or press **Stop looking**. Otherwise it expires on its own.
+
+## Member commands
+
+| Command | When to use it |
+| --- | --- |
+| `/roster` | See who has each seat, who’s signed up as a sub, and which seats are open for one map over the next 24 hours. Times use your local timezone. Only you see the result. |
+| `/sign_up` | Join a particular shift as a main or sub. Add your in-game platform, such as “bottom left,” in the optional comment. |
+| `/lf` | Join the pool of players available now for a limited number of hours. |
+| `/cant_make_it` | Know early that you’ll miss a shift? Pick the date and shift. The bot looks for a replacement for that occurrence and keeps your daily signup. |
+| `/replace` | Leaving for the rest of your shift? Open the rest of your booking and say which platform needs filling. |
+| `/cover` | Coming back? Enter how many hours you’ll be away. For a 30-minute break, enter **0.5**. The bot reserves your return and reminds you when cover ends. |
+
+Anyone can use **/replace** or **/cover**. If you have no current seat, choose a map and enter the hours you need. This creates a separate request in the map channel.
+
+## From reminder to handoff
+
+1. About **30 minutes before your shift**, look for your personal mention in the map channel. Press **I’m showing up** or **I can’t make it**. If you leave it unanswered, your seat stays pending.
+2. When someone needs a replacement or cover, **subs get first call**. If the opening is still there five minutes later, the bot pings matching **/lf** players. When it finds no eligible sub, it checks **/lf** immediately. For a separate map request, it looks across the map’s published recurring sub lists and skips the person asking.
+3. **Urgent?** Anyone viewing an open request can press **Ping map role** immediately. Each opening allows one role ping.
+4. To help, press **Claim all or part**. Enter the hours you can take or leave the duration blank to take the available interval. If you joined through **/lf**, your availability end time limits the claim. Add your platform if useful. Wait for the claim announcement before handing off in-game.
+
+**Example:** You’re booked for DSG from 5 PM to 1 AM and use **/replace** at 7 PM. Someone claims two hours starting at 7 PM. They take **7–9 PM**, and the bot advertises **9 PM–1 AM** to subs and available /lf players. If you only need a break from 7–9 PM and plan to return, use **/cover** for two hours instead.
+
+## For mods
+
+- **/map_setup** connects each map to its Discord role, text announcement channel and timetable timezone. Run it once per map. DSG and FH can use different channels.
+- **/manage** lets an admin choose their own timezone, enter daily shift times, set the seat count for each shift, and assign members as mains or subs. For a four-person DSG party, enter **4**. Add as many daily shifts as the rotation needs. The bot tracks dates and handles shifts that cross midnight.
+- Press **Publish timetable** when the draft is ready. Use **Edit timing / seats** and publish again when the schedule changes. Shifts that already have a roster keep their times. The test server allows gaps. Other servers require the schedule to cover 24 hours. Shifts may not overlap.
+- Only map setup and timetable management require **Manage Server** permission. To test a real sub ping, have one person sign up as a recurring DSG sub and a different person open a DSG request. Check the public request in the configured channel for the sub’s mention.
