@@ -2,7 +2,7 @@
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 os.environ.setdefault("DB_PATH",":memory:")
 import bot
@@ -20,17 +20,23 @@ class DiscordFlowTests(unittest.IsolatedAsyncioTestCase):
         patch.object(bot,"now",return_value=self.t).start()
         self.members={u:SimpleNamespace(id=u,roles=[SimpleNamespace(id=r) for r in rs])
                       for u,rs in [(1,[10]),(2,[10]),(3,[11]),(4,[10,11]),(5,[])]}
-        self.guild=SimpleNamespace(get_member=self.members.get)
+        self.channel=Mock(spec=bot.discord.Thread)
+        self.channel.id=20
+        self.channel.permissions_for.return_value=SimpleNamespace(view_channel=True,send_messages_in_threads=True,mention_everyone=True,read_message_history=True)
+        self.channel.send=AsyncMock(return_value=SimpleNamespace(id=999))
+        self.guild=SimpleNamespace(get_member=self.members.get,me=SimpleNamespace(id=999),get_channel_or_thread=lambda _:self.channel)
         for mid in [1,2]:
-            self.db.run("insert into maps values(?,?,?,?,?)",mid,["DSG","FH"][mid-1],mid+9,20,"UTC")
+            self.db.run("insert into maps values(?,?,?,?,?)",mid,["DSG","FH"][mid-1],mid+9,19+mid,"UTC")
+        for u,mid in [(1,1),(2,1),(3,2),(4,1),(4,2)]:
+            self.db.run("insert into lf_maps values(?,?)",u,mid)
         self.db.run("insert into shifts values(1,1,1,?,?,4)",self.t-300,self.t+10800)
         self.seat=self.db.seat(1,1,self.t-300,self.t+10800,1,"3F","confirmed")
         self.db.run("insert into subs values(1,5,'left')")
 
     def interaction(self,u=1):
-        return SimpleNamespace(guild_id=123,user=self.members[u],guild=self.guild,
+        return SimpleNamespace(channel_id=20,channel=self.channel,guild_id=123,user=self.members[u],guild=self.guild,
             permissions=SimpleNamespace(manage_guild=False),
-            response=SimpleNamespace(send_modal=AsyncMock(),send_message=AsyncMock(),is_done=lambda:False))
+            followup=SimpleNamespace(send=AsyncMock()),response=SimpleNamespace(defer=AsyncMock(),send_modal=AsyncMock(),send_message=AsyncMock(),is_done=lambda:False))
 
     async def modal(self,i,call,*values):
         await call
@@ -38,10 +44,10 @@ class DiscordFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(form.to_dict())
         await form.submit(i,*values)
 
-    async def test_lf_roles_form_and_partial_claim(self):
+    async def test_lf_thread_form_and_partial_claim(self):
         i=self.interaction(4)
         await self.modal(i,bot.lf.callback(i),"1.5","0","bottom")
-        self.assertIn("DSG / FH",i.response.send_message.await_args.args[0])
+        self.assertIn("DSG",i.response.send_message.await_args.args[0])
         main=self.interaction()
         await self.modal(main,bot.replace.callback(main),"3F/4F")
         gap=self.db.one("select * from gaps")
@@ -90,8 +96,16 @@ class DiscordFlowTests(unittest.IsolatedAsyncioTestCase):
         listed=self.db.one("select * from lf where user=4")
         self.assertEqual((listed["starts"],listed["until"]),(self.t+600,self.t+4200))
 
-    async def test_lf_needs_map_role(self):
-        with self.assertRaises(Rule): await bot.lf.callback(self.interaction(5))
+    async def test_lf_without_roles_in_thread(self):
+        i=self.interaction(5)
+        await self.modal(i,bot.lf.callback(i),"1","0","")
+        self.assertEqual(bot.member_maps(i.user),["DSG"])
+
+    async def test_lf_outside_thread_offers_map_buttons(self):
+        i=self.interaction(5); i.channel_id=999
+        await bot.lf.callback(i)
+        i.response.send_modal.assert_not_awaited()
+        self.assertIn("ms:lf:1",str(i.response.send_message.await_args.kwargs["view"].to_components()))
 
     async def test_cover_from_button(self):
         i=self.interaction()
@@ -104,19 +118,16 @@ class DiscordFlowTests(unittest.IsolatedAsyncioTestCase):
         g=self.db.release(self.seat,1,"replace","bottom",self.t)
         outside=self.interaction(3)
         await bot.dispatch(outside,"ping",[str(g)])
-        with self.assertRaises(Rule):
-            await self.modal(outside,bot.claim_form(outside,g),"","")
-        sub=self.interaction(5)
-        await self.modal(sub,bot.claim_form(sub,g),"","left")
-        self.assertEqual(self.db.one("select user from seats where status='confirmed' order by id desc limit 1")[0],5)
+        await self.modal(outside,bot.claim_form(outside,g),"","")
+        self.assertEqual(self.db.one("select user from seats where status='confirmed' order by id desc limit 1")[0],3)
 
     async def test_recurring_admin_button_checks_permission(self):
         with self.assertRaises(Rule): await bot.dispatch(self.interaction(4),"publish",["1"])
 
     async def test_notification_mentions_and_clickable_buttons(self):
-        channel=SimpleNamespace(id=20,send=AsyncMock(return_value=SimpleNamespace(id=999)))
+        channel=self.channel
         role=SimpleNamespace(id=10,mention="<@&10>")
-        self.guild.get_channel=lambda _:channel
+        self.guild.get_channel_or_thread=lambda _:channel
         self.guild.get_role=lambda _:role
         g=self.db.release(self.seat,1,"replace","3F @everyone",self.t)
         await bot.deliver(dict(kind="open",ref=g),self.guild)
@@ -127,7 +138,9 @@ class DiscordFlowTests(unittest.IsolatedAsyncioTestCase):
         await bot.dispatch(self.interaction(3),"ping",[str(g)])
         await bot.deliver(dict(kind="role",ref=g),self.guild)
         args=channel.send.await_args
-        self.assertEqual(args.kwargs["allowed_mentions"].roles,[role])
+        self.assertTrue(args.args[0].startswith("@here"))
+        self.assertEqual(args.kwargs["allowed_mentions"].to_dict()["parse"],["everyone"])
+        self.assertNotIn("@everyone",args.args[0])
 
     async def test_checkin_is_personal(self):
         self.db.run("update seats set status='pending' where id=?",self.seat)
@@ -206,7 +219,7 @@ class DiscordFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Asia/Singapore",embed.footer.text)
 
     async def test_roster_ambiguous_party_prompts(self):
-        i=self.interaction(5)
+        i=self.interaction(5); i.channel_id=999
         await bot.roster.callback(i)
         kwargs=i.response.send_message.await_args.kwargs
         self.assertNotIn("embed",kwargs)
@@ -316,8 +329,8 @@ class DiscordFlowTests(unittest.IsolatedAsyncioTestCase):
         self.db.run("insert into live values(101,1,0,0,4)")
         self.db.run("insert into regular values(101,5,'sub','')")
         self.db.run("insert into lf(user,until,note) values(2,?,'')",self.t+3600)
-        channel=SimpleNamespace(id=20,send=AsyncMock(return_value=SimpleNamespace(id=999)))
-        self.guild.get_channel=lambda _:channel
+        channel=self.channel
+        self.guild.get_channel_or_thread=lambda _:channel
         for kind in ("replace","cover"):
             i=self.interaction(3)
             await self.modal(i,bot.practice_form(i,1,kind),"1","bottom")
@@ -335,8 +348,8 @@ class DiscordFlowTests(unittest.IsolatedAsyncioTestCase):
         self.db.run("delete from subs")
         self.db.seat(1,2,self.t,self.t+3600,5,"","confirmed")
         self.guild.get_member=lambda _:None
-        channel=SimpleNamespace(id=20,send=AsyncMock(return_value=SimpleNamespace(id=999)))
-        self.guild.get_channel=lambda _:channel
+        channel=self.channel
+        self.guild.get_channel_or_thread=lambda _:channel
         for kind in ("replace","cover"):
             i=self.interaction(3)
             await self.modal(i,bot.practice_form(i,1,kind),"1","help")
@@ -345,3 +358,49 @@ class DiscordFlowTests(unittest.IsolatedAsyncioTestCase):
             args=channel.send.await_args
             self.assertIn("<@5>",args.args[0])
             self.assertEqual([u.id for u in args.kwargs["allowed_mentions"].users],[5])
+
+    async def test_here_refuses_parent_channel(self):
+        self.guild.get_channel_or_thread=lambda _:SimpleNamespace(id=20)
+        g=self.db.release(self.seat,1,"replace","",self.t)
+        with self.assertRaises(Rule):
+            await bot.dispatch(self.interaction(3),"ping",[str(g)])
+        self.assertEqual(self.db.one("select pinged from gaps where id=?",g)[0],0)
+        with self.assertRaises(Rule):
+            await bot.deliver(dict(kind="role",ref=g),self.guild)
+
+    async def test_here_missing_permission_does_not_consume_button(self):
+        self.channel.permissions_for.return_value.mention_everyone=False
+        g=self.db.release(self.seat,1,"replace","",self.t)
+        with self.assertRaises(Rule):
+            await bot.dispatch(self.interaction(3),"ping",[str(g)])
+        self.assertEqual(self.db.one("select pinged from gaps")[0],0)
+
+    async def test_uncached_thread_fetched_without_parent_fallback(self):
+        self.guild.get_channel_or_thread=lambda _:None
+        self.guild.fetch_channel=AsyncMock(return_value=self.channel)
+        g=self.db.release(self.seat,1,"replace","@here @everyone <@&10>",self.t)
+        await bot.deliver(dict(kind="role",ref=g),self.guild)
+        self.guild.fetch_channel.assert_awaited_once_with(20)
+        msg=self.channel.send.await_args.args[0]
+        self.assertEqual(msg.count("@here"),1)
+        self.assertNotIn("@everyone",msg)
+
+    async def test_map_setup_in_thread_without_role_preserves_roster(self):
+        i=self.interaction(); i.permissions.manage_guild=True
+        await bot.setup.callback(i,"DSG","UTC")
+        self.assertIsNone(self.db.one("select role from maps where id=1")[0])
+        self.assertEqual(len(self.db.rows("select * from seats")),1)
+        i.channel=Mock(spec=bot.discord.Thread); i.channel.id=22
+        i.channel.permissions_for.return_value=self.channel.permissions_for.return_value
+        await bot.setup.callback(i,"New map","UTC")
+        self.assertEqual(len(self.db.rows("select * from maps where role is null")),2)
+
+    async def test_lf_thread_isolation_and_multiple_map_opt_in(self):
+        i=self.interaction(5)
+        await self.modal(i,bot.lf.callback(i),"1","0","")
+        self.assertEqual(bot.member_maps(i.user),["DSG"])
+        i.channel_id=21
+        await self.modal(i,bot.lf.callback(i),"1","0","")
+        self.assertEqual(set(bot.member_maps(i.user)),{"DSG","FH"})
+        await bot.dispatch(i,"stop",[])
+        self.assertEqual(bot.member_maps(i.user),[])

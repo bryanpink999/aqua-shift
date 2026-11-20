@@ -59,6 +59,7 @@ create table if not exists practice(id integer primary key,map integer,a integer
 create table if not exists subs(shift integer,user integer,note text,primary key(shift,user));
 create table if not exists seats(id integer primary key,shift integer,seat integer,a integer,b integer,user integer,note text,status text);
 create table if not exists gaps(id integer primary key,shift integer,seat integer,a integer,b integer,owner integer,kind text,note text,stage integer,escalate integer,pinged integer default 0,claimed integer default 0);
+create table if not exists lf_maps(user integer,map integer,primary key(user,map));
 create table if not exists lf(user integer primary key,until integer,note text);
 create table if not exists claims(gap integer primary key,user integer,a integer,b integer,note text);
 create table if not exists delayed(kind text,ref integer,due integer,primary key(kind,ref));

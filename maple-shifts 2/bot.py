@@ -9,6 +9,7 @@ from discord import app_commands
 from discord.ext import tasks
 from rotation import Store, Rule, minutes, hours, clock
 
+VERSION = "2026.11.20-thread-here"
 log = logging.getLogger("shifts")
 TEST_GUILD = 1573064240598618252
 GUILD = int(os.environ.get("GUILD_ID","0"))
@@ -60,14 +61,25 @@ def instance(sid):
         return db.one("select -id as id,map,a,b,1 as cap from practice where id=?",-int(sid))
     return db.one("select * from shifts where id=?",sid)
 
-def roles(member):
-    return {r.id for r in member.roles}
-
 def window(g):
     return f"{maprow(instance(g['shift'])['map'])['name']} · seat {g['seat']} · <t:{g['a']}:f> → <t:{g['b']}:f>"
 
 def member_maps(member):
-    return [r["name"] for r in db.rows("select * from maps") if r["role"] in roles(member)]
+    return [r["name"] for r in db.rows("select maps.name from maps join lf_maps on lf_maps.map=maps.id where lf_maps.user=?",member.id)]
+
+async def resolve_channel(guild,cid):
+    channel=guild.get_channel_or_thread(cid)
+    if channel is None:
+        channel=await guild.fetch_channel(cid)
+    return channel
+
+def thread_ping_permissions(channel,guild):
+    if not isinstance(channel,discord.Thread):
+        raise Rule("Run /map_setup inside the map rotation thread first. @here is only allowed in threads.")
+    perms=channel.permissions_for(guild.me)
+    if not (perms.view_channel and perms.send_messages_in_threads and perms.mention_everyone):
+        raise Rule("Allow the bot View Channel, Send Messages in Threads and Mention @everyone/@here in this thread.")
+    return perms
 
 class Form(discord.ui.Modal):
     def __init__(self,title,fields,submit):
@@ -102,6 +114,7 @@ class Client(discord.Client):
         target=discord.Object(id=GUILD)
         tree.copy_global_to(guild=target)
         synced=await tree.sync(guild=target)
+        log.info("Bot version: %s", VERSION)
         log.info("Registered guild commands: %s", ", ".join(c.name for c in synced))
         scheduler.start()
 
@@ -120,25 +133,26 @@ async def command_error(i,error):
         log.error("Command failed",exc_info=error)
         await reply(i,"Action failed. Check the roster and bot log.")
 
-@tree.command(name="map_setup",description="Admin: connect a map, role, channel and timetable timezone")
+@tree.command(name="map_setup",description="Admin: connect a map to its rotation thread and timetable timezone")
 @app_commands.checks.has_permissions(manage_guild=True)
-async def setup(i:discord.Interaction,name:str,role:discord.Role,channel:discord.TextChannel,timezone:str="Asia/Singapore"):
+async def setup(i:discord.Interaction,name:str,timezone:str="Asia/Singapore"):
     guard(i)
     try:
         ZoneInfo(timezone)
     except (ValueError,ZoneInfoNotFoundError):
         raise Rule("Use an IANA timezone such as Asia/Singapore or UTC.")
-    if role.is_default() or role.managed or len(name.strip()) not in range(1,41):
-        raise Rule("Choose an ordinary map role and a map name of 1–40 characters.")
-    perms=channel.permissions_for(i.guild.me)
-    if not (perms.view_channel and perms.send_messages and perms.read_message_history and (role.mentionable or perms.mention_everyone)):
-        raise Rule("Grant channel view, send and history access, plus permission to mention the selected role.")
+    if len(name.strip()) not in range(1,41):
+        raise Rule("Choose a map name of 1–40 characters.")
+    channel=i.channel
+    perms=thread_ping_permissions(channel,i.guild)
+    if not perms.read_message_history:
+        raise Rule("Allow the bot Read Message History in this thread.")
     with db.tx():
-        other=db.rows("select * from maps where role=? and name!=? collate nocase",role.id,name.strip())
-        if other: raise Rule("That role is already mapped.")
-        db.run("""insert into maps(name,role,channel,tz) values(?,?,?,?) on conflict(name) do update set
-                  role=excluded.role,channel=excluded.channel,tz=excluded.tz""",name.strip(),role.id,channel.id,timezone)
-    await reply(i,"Map saved. Open /manage to set the daily rotation.")
+        other=db.rows("select * from maps where channel=? and name!=? collate nocase",channel.id,name.strip())
+        if other: raise Rule("That thread is already connected to another map.")
+        db.run("""insert into maps(name,role,channel,tz) values(?,NULL,?,?) on conflict(name) do update set
+                  role=NULL,channel=excluded.channel,tz=excluded.tz""",name.strip(),channel.id,timezone)
+    await reply(i,"Map saved to this thread. No map role needed. Open /manage to set the daily rotation.")
 
 async def choose_map(i,action):
     guard(i)
@@ -269,7 +283,6 @@ async def overview(i,zone,page_num,mid=None,days=1):
         if len(matches)!=1:
             active={r["map"] for r in db.rows("select distinct shifts.map from seats join shifts on shifts.id=seats.shift where user=? and seats.a<=? and seats.b>?",i.user.id,t,t)}
             matches=[m for m in maps if m["id"] in active]
-        if len(matches)!=1: matches=[m for m in maps if m["role"] in roles(i.user)]
         if len(matches)!=1:
             if len(maps)==1: matches=maps
             else:
@@ -445,11 +458,14 @@ async def lf_matches(i,num):
     matches=available_openings(i)
     await page(i,"lfmatches","all",num,matches,lambda g:(f"{maprow(instance(g['shift'])['map'])['name']} · opening #{g['id']}",f"gap:{g['id']}"),"Choose a matching opening." if matches else "No matching openings right now.")
 
-async def lf_form(i):
-    if not member_maps(i.user): raise Rule("Get a configured map role from a guild admin first.")
+async def lf_form(i,mid=None):
+    if mid is None:
+        matches=db.rows("select id from maps where channel=?",getattr(i,"channel_id",None))
+        if len(matches)!=1:
+            return await choose_map(i,"lf")
+        mid=matches[0]["id"]
+    m=maprow(mid)
     async def save(j,duration,delay,note):
-        maps=member_maps(j.user)
-        if not maps: raise Rule("You need a map role.")
         try:
             delay_hours=float(delay or "0")
         except ValueError:
@@ -458,7 +474,11 @@ async def lf_form(i):
         start=now()+wait
         end=start+hours(duration)
         with db.tx():
+            if not db.rows("select 1 from lf where user=? and until>?",j.user.id,now()):
+                db.run("delete from lf_maps where user=?",j.user.id)
+            db.run("insert or ignore into lf_maps(user,map) values(?,?)",j.user.id,mid)
             db.run("insert or replace into lf(user,until,note,starts) values(?,?,?,?)",j.user.id,end,note,start)
+        maps=member_maps(j.user)
         matches=available_openings(j)
         if matches:
             await reply(j,f"You're listed for {span(start,end)}. An opening overlaps your availability:\n{window(matches[0])}",
@@ -560,9 +580,6 @@ async def claim_form(i,gid):
         t=now()
         with db.tx():
             listed=db.rows("select * from lf where user=? and until>?",j.user.id,t)
-            is_sub=j.user.id in registered_subs(g,t)
-            if s["id"]>0 and j.guild_id!=TEST_GUILD and not is_sub and maprow(s["map"])["role"] not in roles(j.user):
-                raise Rule("You need the map role or a sub registration for this shift.")
             start=max(t,g["a"],listed[0]["starts"] if listed else 0)
             end=g["b"] if not duration else start+hours(duration)
             if listed: end=min(end,listed[0]["until"])
@@ -583,9 +600,11 @@ async def dispatch(i,cmd,p):
     if cmd=="overview": return await overview(i,p[0],int(p[1]),int(p[2]) if len(p)>2 else None,int(p[3]) if len(p)>3 else 1)
     if cmd=="zones": return await zone_prompt(i)
     if cmd=="zone": return await choose_zone(i,p[0])
-    if cmd=="lf": return await lf_form(i)
+    if cmd=="lf": return await lf_form(i,int(p[0]) if p else None)
     if cmd=="stop":
-        with db.tx(): db.run("delete from lf where user=?",uid)
+        with db.tx():
+            db.run("delete from lf where user=?",uid)
+            db.run("delete from lf_maps where user=?",uid)
         return await reply(i,"You’ve stopped looking. Existing claims stay booked.")
     if cmd=="page":
         kind,key,num=p
@@ -644,15 +663,20 @@ async def dispatch(i,cmd,p):
         return await reply(i,window(g)+" · "+clean(g["note"]),gap_buttons(g))
     if cmd=="claim": return await claim_form(i,int(p[0]))
     if cmd=="ping":
+        g=db.one("select * from gaps where id=?",int(p[0]))
+        m=maprow(instance(g["shift"])["map"])
+        await i.response.defer(ephemeral=True)
+        channel=await resolve_channel(i.guild,m["channel"])
+        thread_ping_permissions(channel,i.guild)
         with db.tx(): db.ping(int(p[0]),now())
-        return await reply(i,"Map-role ping queued.")
+        return await reply(i,"Thread @here ping queued.")
     if cmd=="lfpool":
         mid=int(p[0])
         m=maprow(mid)
         lines=[]
         for av in db.rows("select * from lf where until>? order by until",now()):
             member=i.guild.get_member(av["user"])
-            if member and m["role"] in roles(member):
+            if member and db.rows("select 1 from lf_maps where user=? and map=?",member.id,mid):
                 lines.append(f"{mention(member.id)} · {span(max(now(),av['starts']),av['until'])} · {clean(av['note'])}")
         return await list_text(i,f"**{m['name']} · looking for a seat**",lines or ["Nobody currently listed."])
 
@@ -672,7 +696,7 @@ async def on_interaction(i):
 
 def gap_buttons(g):
     items=[("Claim all or part",f"claim:{g['id']}")]
-    if not g["pinged"]: items.append(("Ping map role",f"ping:{g['id']}"))
+    if not g["pinged"]: items.append(("Ping @here (thread)",f"ping:{g['id']}"))
     items.append(("View roster",f"board:{g['shift']}"))
     return buttons(*items)
 
@@ -698,7 +722,7 @@ def registered_subs(g,t):
 
 def recipients(guild,g,mode,t):
     sid=g["shift"]
-    rid=maprow(instance(sid)["map"])["role"]
+    mid=instance(sid)["map"]
     a=max(t,g["a"])
     candidates=set()
     if mode!="lf":
@@ -710,7 +734,7 @@ def recipients(guild,g,mode,t):
         for row in db.rows("select * from lf where until>? and starts<?",a,g["b"]):
             member=guild.get_member(row["user"])
             start=max(a,row["starts"])
-            if member and rid in roles(member) and db.available(member.id,start,min(row["until"],g["b"])):
+            if member and db.rows("select 1 from lf_maps where user=? and map=?",member.id,mid) and db.available(member.id,start,min(row["until"],g["b"])):
                 candidates.add(member.id)
     candidates.discard(g["owner"])
     return sorted(candidates)
@@ -731,7 +755,7 @@ async def deliver(job,guild):
         if g["b"]<=t or (g["claimed"] and kind!="taken"): return
     if s["b"]<=t: return
     m=maprow(s["map"])
-    channel=guild.get_channel(m["channel"])
+    channel=await resolve_channel(guild,m["channel"])
     if channel is None: raise RuntimeError(f"Map channel missing for {m['name']}")
     if kind=="board":
         return await channel.send(f"**{m['name']} shift** · {span(s['a'],s['b'])} · {s['cap']} seats",
@@ -745,7 +769,7 @@ async def deliver(job,guild):
     if kind=="taken":
         post=db.rows("select * from posts where gap=?",ref)
         if post:
-            old=guild.get_channel(post[0]["channel"])
+            old=await resolve_channel(guild,post[0]["channel"])
             if old:
                 try: await old.get_partial_message(post[0]["message"]).edit(view=buttons(("View updated roster",f"board:{s['id']}")))
                 except discord.NotFound: pass
@@ -754,9 +778,9 @@ async def deliver(job,guild):
     prefix="Open " if s["id"]<0 else ""
     msg=f"**{prefix}{g['kind'].title()} · {window(g)}**\nRequested platform / comment · {clean(g['note'])}"
     if kind=="role":
-        role=guild.get_role(m["role"])
-        if role is None: raise RuntimeError("Configured map role missing")
-        return await channel.send(f"{role.mention} · {msg}",allowed_mentions=discord.AllowedMentions(roles=[role]),view=gap_buttons(g))
+        # Keep the legacy job kind for queued jobs and existing button IDs.
+        thread_ping_permissions(channel,guild)
+        return await channel.send(f"@here · {msg}",allowed_mentions=discord.AllowedMentions(everyone=True,roles=False,users=False,replied_user=False),view=gap_buttons(g))
     targets=recipients(guild,g,kind,t)
     if kind=="open" and g["kind"] in ("cover","replace"):
         subs=recipients(guild,g,"subs",t)
