@@ -40,7 +40,7 @@ class DiscordFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_lf_roles_form_and_partial_claim(self):
         i=self.interaction(4)
-        await self.modal(i,bot.lf.callback(i),"1.5","bottom")
+        await self.modal(i,bot.lf.callback(i),"1.5","0","bottom")
         self.assertIn("DSG / FH",i.response.send_message.await_args.args[0])
         main=self.interaction()
         await self.modal(main,bot.replace.callback(main),"3F/4F")
@@ -50,6 +50,45 @@ class DiscordFlowTests(unittest.IsolatedAsyncioTestCase):
         rest=self.db.one("select * from gaps where claimed=0")
         self.assertEqual((rest["a"],rest["note"]),(self.t+5400,"3F/4F"))
         self.assertEqual(bot.recipients(self.guild,rest,"open",self.t),[5])
+
+    async def test_delayed_lf_claim_preserves_both_unfilled_intervals(self):
+        player=self.interaction(4)
+        await self.modal(player,bot.lf.callback(player),"2","0.5","top")
+        listed=self.db.one("select * from lf where user=4")
+        self.assertEqual((listed["starts"],listed["until"]),(self.t+1800,self.t+9000))
+        owner=self.interaction(1)
+        await self.modal(owner,bot.replace.callback(owner),"top")
+        gap=self.db.one("select * from gaps")
+        self.assertIn(4,bot.recipients(self.guild,gap,"lf",self.t))
+        await self.modal(player,bot.claim_form(player,gap["id"]),"1","top")
+        claim=self.db.one("select * from claims")
+        self.assertEqual((claim["a"],claim["b"]),(self.t+1800,self.t+5400))
+        remaining=self.db.rows("select a,b from gaps where claimed=0 order by a")
+        self.assertEqual([tuple(r) for r in remaining],
+                         [(self.t,self.t+1800),(self.t+5400,self.t+10800)])
+        self.assertNotIn(4,bot.recipients(self.guild,self.db.one("select * from gaps where a=?",self.t),"lf",self.t))
+
+    async def test_delayed_lf_cannot_take_cover_after_return(self):
+        player=self.interaction(4)
+        await self.modal(player,bot.lf.callback(player),"2","1","top")
+        owner=self.interaction(1)
+        await self.modal(owner,bot.cover.callback(owner),"0.5","top")
+        gap=self.db.one("select * from gaps")
+        self.assertNotIn(4,bot.recipients(self.guild,gap,"lf",self.t))
+        with self.assertRaises(Rule):
+            await self.modal(player,bot.claim_form(player,gap["id"]),"","top")
+        self.assertFalse(self.db.rows("select * from claims"))
+
+    async def test_lf_delay_validation_and_edit(self):
+        player=self.interaction(4)
+        for delay in ("-1","nan","inf","abc"):
+            with self.assertRaises(Rule):
+                await self.modal(player,bot.lf.callback(player),"2",delay,"")
+        await self.modal(player,bot.lf.callback(player),"2","0.5","")
+        with patch.object(bot,"now",return_value=self.t+600):
+            await self.modal(player,bot.lf_form(player),"1","0","")
+        listed=self.db.one("select * from lf where user=4")
+        self.assertEqual((listed["starts"],listed["until"]),(self.t+600,self.t+4200))
 
     async def test_lf_needs_map_role(self):
         with self.assertRaises(Rule): await bot.lf.callback(self.interaction(5))
@@ -212,6 +251,40 @@ class DiscordFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("<@999>",str(rows[0]))
         self.assertTrue(any(r[0]==a+86400 for r in rows))
 
+    async def test_week_roster_pages_keep_seven_day_horizon(self):
+        self.db.run("insert into live values(7,1,0,0,100)")
+        self.db.run("insert into regular values(7,999,'main','')")
+        rows=bot.roster_entries(1,self.t,7)
+        self.assertTrue(any(a>self.t+6*86400 for a,*_ in rows))
+        self.assertFalse(any(a>=self.t+7*86400 for a,*_ in rows))
+        i=self.interaction(5)
+        await bot.roster7d.callback(i)
+        action=i.response.send_message.await_args.kwargs["view"].children[0].custom_id
+        _,cmd,*parts=action.split(":")
+        await bot.dispatch(i,cmd,parts)
+        kwargs=i.response.send_message.await_args.kwargs
+        self.assertIn("Next 7 days",kwargs["embed"].title)
+        action=kwargs["view"].children[0].custom_id
+        _,cmd,*parts=action.split(":")
+        await bot.dispatch(i,cmd,parts)
+        self.assertIn("Next 7 days",i.response.send_message.await_args.kwargs["embed"].title)
+
+    async def test_absence_seven_days_ahead(self):
+        slot=self.db.run("insert into slots(map,a,b,cap) values(2,0,180,4)")
+        self.db.publish(2,allow_gaps=True)
+        self.db.assign(slot,3,"main","left")
+        self.db.assign(slot,4,"sub","")
+        i=self.interaction(3)
+        await bot.dispatch(i,"absence",["1","0"])
+        actions=i.response.send_message.await_args.kwargs["view"].children
+        action=next(c.custom_id for c in actions if ":absent:" in c.custom_id)
+        _,cmd,*parts=action.split(":")
+        await self.modal(i,bot.dispatch(i,cmd,parts),"left")
+        gap=self.db.one("select * from gaps")
+        self.assertGreater(gap["a"],self.t+6*86400)
+        self.assertEqual(bot.recipients(self.guild,gap,"open",self.t),[4])
+        self.assertTrue(self.db.rows("select * from regular where user=3"))
+
     async def test_advance_absence_call_and_reminder(self):
         db=self.db
         slot=db.run("insert into slots(map,a,b,cap) values(2,0,180,4)")
@@ -228,7 +301,7 @@ class DiscordFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(db.rows("select * from jobs where kind='check'"))
         with self.assertRaises(Rule), db.tx(): db.early_decline(3,slot,a,b,"",self.t)
         db.tick(self.t+301)
-        db.run("insert into lf values(?,?,?)",4,b,"")
+        db.run("insert into lf(user,until,note) values(?,?,?)",4,b,"")
         self.assertEqual([x["id"] for x in bot.available_openings(self.interaction(4))],[g["id"]])
         db.claim(g["id"],4,self.t+301,a+3600,"")
         self.assertEqual(db.one("select a from gaps where claimed=0")[0],a+3600)
@@ -242,7 +315,7 @@ class DiscordFlowTests(unittest.IsolatedAsyncioTestCase):
         self.db.run("delete from shifts")
         self.db.run("insert into live values(101,1,0,0,4)")
         self.db.run("insert into regular values(101,5,'sub','')")
-        self.db.run("insert into lf values(2,?,'')",self.t+3600)
+        self.db.run("insert into lf(user,until,note) values(2,?,'')",self.t+3600)
         channel=SimpleNamespace(id=20,send=AsyncMock(return_value=SimpleNamespace(id=999)))
         self.guild.get_channel=lambda _:channel
         for kind in ("replace","cover"):

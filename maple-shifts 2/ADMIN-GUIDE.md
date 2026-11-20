@@ -52,7 +52,7 @@ Press **Publish timetable**. In the test server you can publish a single shift a
 | Join today only | Shift announcement → View / join roster | Take a vacant full seat, join the sub list or browse open handoffs. |
 | Confirm attendance | Personal mention in the map channel → I’m showing up | Each main gets an individual check-in about 30 minutes before the shift. Only the named player can answer. |
 | Decline | Check-in → I can’t make it | Opens that seat for this occurrence and keeps your recurring signup. Include the platform that needs filling. |
-| Look for training | /lf | Enter hours available from now and an optional platform/comment. Your DSG and FH roles select eligible maps automatically. With both roles you can receive calls for either map. |
+| Look for training | /lf | Enter hours you can play and how many hours from now you can start (0 means now), plus an optional platform/comment. Your DSG and FH roles select eligible maps automatically. With both roles you can receive calls for either map. |
 | See available players | Shift announcement → Looking for a seat | Shows the active /lf pool for that map, each player’s end time and comment. |
 | Leave early | /replace or roster → Request replacement | Opens the remainder of your current booking. Enter the platform you need filled. |
 | Take a break | /cover or roster → Request cover | Enter duration in hours and the requested platform. The bot reserves your return time and pings you when cover ends. |
@@ -69,7 +69,7 @@ A player uses **/lf** at midnight for 1.5 hours and writes “bottom lane.” At
 
 For temporary cover the final handoff is the original trainer’s return. A returned seat stays reserved even if the trainer is late. The trainer can use **I can’t make it** on the return reminder to advertise the remaining interval. When requesting a replacement or break, wait for the claim announcement before leaving the map. The bot cannot observe who is in the game.
 
-**Edit availability** restarts the /lf duration from the edit time. **Stop looking** withdraws future /lf availability. Time already claimed stays booked. Availability expires automatically. The platform/comment is optional in all player signup, availability, handoff and claim forms.
+**Edit availability** recalculates the /lf start from the edit time plus the entered delay. The duration runs from that start. **Stop looking** withdraws future /lf availability. Time already claimed stays booked. Availability expires automatically. The platform/comment is optional in all player signup, availability, handoff and claim forms.
 
 ## Editing the daily timetable
 
@@ -102,3 +102,19 @@ In any configured server, anyone can use `/cover` or `/replace`. Members without
 Use `/cant_make_it`, select the dated shift (use Later week to look further ahead), and submit the optional platform note. The bot opens that one seat and keeps the recurring signup. Registered subs get first call. After five minutes the bot contacts matching /lf players, or calls them immediately if no eligible sub is found. Later /lf signups see matching openings when they register. Members can claim part of the shift or press Ping map role immediately. Replacements booked in advance get a check-in 30 minutes before their booked segment. An advance request saves the lineup and timing for that occurrence early, so later recurring edits apply to other occurrences.
 
 Open map requests from /replace or /cover call the map’s recurring subs across all published time slots, including subs currently booked. The requester is excluded.
+
+
+## Seven-day roster
+
+Use `/roster7d` for the same party overview across the next seven days. It supports the same timezone option as `/roster`, with dated shift headings and Previous / Next buttons. Existing bookings and advance absences override the recurring lineup for their occurrence. Daily `/roster` still covers the next 24 hours.
+
+For an absence seven days ahead or further, use `/cant_make_it` and press **Later week**. Pick the dated shift and submit. This opens only that occurrence for subs and keeps the regular signup. Deploy the updated code and restart the bot to register `/roster7d` in the configured server.
+
+
+## Delayed availability and claim wording
+
+The /lf form asks **How long are you available for?** and **How long from now are you available?** Both use hours. A duration of 2 and a start delay of 0.5 means a two-hour session beginning in 30 minutes. Delay 0 means ready now. The confirmation and Looking for a seat list display the start and end times.
+
+Only openings overlapping that availability are matched. Cover and replacement claim forms ask **How long are you available for?** The claim starts at the latest of now, the opening start and the player's /lf start, and ends within both the opening and their /lf end. Any uncovered time before and after the claim remains advertised. A delayed cover claim cannot extend the original trainer's return time.
+
+Existing SQLite databases gain the availability start field automatically on startup. Older /lf entries keep their end times and are treated as available immediately. Back up the existing database before upgrading, retain it on the host, and run one bot instance.

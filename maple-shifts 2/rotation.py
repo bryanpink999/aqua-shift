@@ -69,6 +69,10 @@ class Store:
         self.db = sqlite3.connect(path, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        with self.tx():
+            columns = {row["name"] for row in self.rows("pragma table_info(lf)")}
+            if "starts" not in columns:
+                self.run("alter table lf add column starts integer not null default 0")
 
     @contextmanager
     def tx(self):
@@ -233,9 +237,10 @@ class Store:
             self.seat(s["shift"],s["seat"],b,s["b"],user,s["note"],"return")
         return self.gap(s["shift"],s["seat"],a,b,user,kind,note or s["note"],now)
 
-    def claim(self,gid,user,now,until,note):
+    def claim(self,gid,user,now,until,note,starts=0):
         g=self.one("select * from gaps where id=? and claimed=0 and b>?",gid,now)
-        a=max(g["a"],now)
+        original_start=max(g["a"],now)
+        a=max(original_start,starts)
         b=min(until,g["b"])
         if b<=a or user==g["owner"]:
             raise Rule("Choose another open seat or adjust your availability.")
@@ -248,6 +253,8 @@ class Store:
             self.run("insert into delayed values('check',?,?)",seat,a-1800)
         self.run("insert into claims values(?,?,?,?,?)",gid,user,a,b,note)
         self.job("taken",gid)
+        if a>original_start:
+            self.gap(g["shift"],g["seat"],original_start,a,g["owner"],"handoff",g["note"],now)
         if b<g["b"]:
             self.gap(g["shift"],g["seat"],b,g["b"],g["owner"],"handoff",g["note"],now)
         return a,b

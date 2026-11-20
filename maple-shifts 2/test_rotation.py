@@ -151,7 +151,7 @@ class RotationTests(unittest.TestCase):
         self.assertTrue(self.db.rows("select * from seats where user=44"))
 
     def test_expiring_lf(self):
-        self.db.run("insert into lf values(33,?,'any')",utc(2))
+        self.db.run("insert into lf(user,until,note) values(33,?,'any')",utc(2))
         self.db.tick(utc(2))
         self.assertFalse(self.db.rows("select * from lf"))
 
@@ -175,3 +175,24 @@ class RotationTests(unittest.TestCase):
         with self.assertRaisesRegex(Rule,"Overlap"):
             validate([dict(a=1380,b=60),dict(a=30,b=90)],allow_gaps=True)
         with self.assertRaises(Rule): validate([],allow_gaps=True)
+
+
+class AvailabilityMigrationTests(unittest.TestCase):
+    def test_old_availability_survives_reopen(self):
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as folder:
+            path=str(Path(folder)/"old.sqlite3")
+            conn=sqlite3.connect(path)
+            conn.execute("create table lf(user integer primary key,until integer,note text)")
+            conn.execute("insert into lf values(7,2000000000,'left')")
+            conn.commit()
+            conn.close()
+            store=Store(path)
+            self.assertEqual(tuple(store.one("select user,until,note,starts from lf")),
+                             (7,2000000000,"left",0))
+            store.db.close()
+            store=Store(path)
+            self.assertEqual(store.one("select starts from lf")[0],0)
+            store.db.close()

@@ -220,9 +220,9 @@ def daily_window(row,t):
         if b>t:
             return a,b
 
-def roster_entries(mid, t):
+def roster_entries(mid, t, days=1):
     """Read-only preview: existing bookings override recurring occurrences."""
-    end=t+86400
+    end=t+days*86400
     entries=[]
     fixed=db.rows("select * from shifts where map=? and b>? and a<? order by a",mid,t,end)
     for r in fixed:
@@ -241,7 +241,7 @@ def roster_entries(mid, t):
         subs=db.rows("select user from subs where shift=? order by user",r["id"])
         entries.append((r["a"],r["b"],lines,subs,False))
     for r in db.rows("select live.*,maps.tz from live join maps on maps.id=live.map where map=?",mid):
-        for offset in (-1,0,1,2):
+        for offset in range(-1,days+2):
             a,b=db.dates(r,t,offset)
             if b<=t or a>=end: continue
             # Published changes take effect after frozen occurrences finish.
@@ -256,9 +256,10 @@ def roster_entries(mid, t):
             entries.append((a,b,lines,[p for p in people if p["kind"]=="sub"],True))
     return sorted(entries,key=lambda e:e[0])
 
-async def overview(i,zone,page_num,mid=None):
+async def overview(i,zone,page_num,mid=None,days=1):
     guard(i)
     if zone != "local" and zone not in ZONE_NAMES: raise Rule("Choose a timezone from the city suggestions.")
+    horizon="24 hours" if days==1 else "7 days"
     t=now()
     maps=db.rows("select * from maps order by name")
     if not maps: return await reply(i,"No parties are configured yet.")
@@ -272,17 +273,17 @@ async def overview(i,zone,page_num,mid=None):
         if len(matches)!=1:
             if len(maps)==1: matches=maps
             else:
-                return await reply(i,"Choose a party · next 24 hours",buttons(*[(m["name"],f"overview:{zone}:0:{m['id']}") for m in maps[:25]]))
+                return await reply(i,f"Choose a party · next {horizon}",buttons(*[(m["name"],f"overview:{zone}:0:{m['id']}:{days}") for m in maps[:25]]))
         mid=matches[0]["id"]
     m=maprow(mid)
     sections=[]
-    for a,b,lines,subs,projected in roster_entries(mid,t):
+    for a,b,lines,subs,projected in roster_entries(mid,t,days):
         label="Now" if a<=t else "Upcoming"
         if projected: label+=" · planned"
         if zone=="local":
             heading=f"**{label}** · <t:{a}:f> → <t:{b}:t>"
         else:
-            def fmt(x): return datetime.fromtimestamp(x,ZoneInfo(zone)).strftime("%a %H:%M")
+            def fmt(x): return datetime.fromtimestamp(x,ZoneInfo(zone)).strftime("%a %d %b %H:%M")
             heading=f"**{label}** · {fmt(a)} → {fmt(b)}"
         if subs: lines=lines+["Subs: "+", ".join(mention(p["user"]) for p in subs)]
         section=heading
@@ -297,12 +298,12 @@ async def overview(i,zone,page_num,mid=None):
         if len(pages[-1])+len(section)+2>3900: pages.append("")
         pages[-1]+=section+"\n\n"
     n=min(max(page_num,0),len(pages)-1)
-    embed=discord.Embed(title=f"{m['name']} · Next 24 hours",description=pages[n].strip() or "No shifts in the next 24 hours.",color=0x279C97)
+    embed=discord.Embed(title=f"{m['name']} · Next {horizon}",description=pages[n].strip() or f"No shifts in the next {horizon}.",color=0x279C97)
     tz_label="Times shown in your local timezone" if zone=="local" else zone
     embed.set_footer(text=f"{tz_label} · Page {n+1}/{len(pages)} · /sign_up to join")
     nav=[]
-    if n: nav.append(("Previous",f"overview:{zone}:{n-1}:{mid}"))
-    if n+1<len(pages): nav.append(("Next",f"overview:{zone}:{n+1}:{mid}"))
+    if n: nav.append(("Previous",f"overview:{zone}:{n-1}:{mid}:{days}"))
+    if n+1<len(pages): nav.append(("Next",f"overview:{zone}:{n+1}:{mid}:{days}"))
     args=dict(embed=embed,view=buttons(*nav) if nav else None,allowed_mentions=QUIET)
     if getattr(i,"type",None)==discord.InteractionType.component:
         return await i.response.edit_message(**args)
@@ -315,6 +316,13 @@ async def roster(i:discord.Interaction,timezone:str=None):
     await overview(i,timezone or "local",0)
 
 roster.autocomplete("timezone")(suggest_zone)
+
+@tree.command(description="See this party’s dated roster for the next seven days")
+@app_commands.describe(timezone="Optional timezone. Otherwise times appear in your local timezone.")
+async def roster7d(i:discord.Interaction,timezone:str=None):
+    await overview(i,timezone or "local",0,days=7)
+
+roster7d.autocomplete("timezone")(suggest_zone)
 
 async def panel(i,mid,editing,num=0):
     m=maprow(mid)
@@ -416,6 +424,7 @@ async def absence_menu(i,week,page_num):
     if week: actions.append(("Earlier week",f"absence:{week-1}:0"))
     actions.append(("Later week",f"absence:{week+1}:0"))
     title="Choose the shift you’ll miss." if rows else "You have no upcoming main seats in this week."
+    title+=f" Week {week+1} · Use Later week for shifts 7 or more days ahead."
     await reply(i,"\n".join([title,*lines]),buttons(*actions))
 
 async def absence_form(i,slot,a,b):
@@ -438,21 +447,31 @@ async def lf_matches(i,num):
 
 async def lf_form(i):
     if not member_maps(i.user): raise Rule("Get a configured map role from a guild admin first.")
-    async def save(j,duration,note):
+    async def save(j,duration,delay,note):
         maps=member_maps(j.user)
         if not maps: raise Rule("You need a map role.")
-        end=now()+hours(duration)
-        with db.tx(): db.run("insert or replace into lf values(?,?,?)",j.user.id,end,note)
+        try:
+            delay_hours=float(delay or "0")
+        except ValueError:
+            raise Rule("Enter your start delay in hours, e.g. 0 for now or 0.5 for 30 minutes.")
+        wait=0 if delay_hours==0 else hours(delay_hours)
+        start=now()+wait
+        end=start+hours(duration)
+        with db.tx():
+            db.run("insert or replace into lf(user,until,note,starts) values(?,?,?,?)",j.user.id,end,note,start)
         matches=available_openings(j)
         if matches:
-            await reply(j,f"You're listed until {stamp(end)}. An opening matches your availability:\n{window(matches[0])}",
+            await reply(j,f"You're listed for {span(start,end)}. An opening overlaps your availability:\n{window(matches[0])}",
                         buttons(("View opening",f"gap:{matches[0]['id']}"),("All matches","lfmatches:all:0"),("Edit availability","lf"),("Stop looking","stop")))
             return
-        await reply(j,f"Looking for {' / '.join(maps)} until {stamp(end)} · {clean(note)}",
+        await reply(j,f"Looking for {' / '.join(maps)} · {span(start,end)} · {clean(note)}",
                     buttons(("Matching openings","lfmatches:all:0"),("Edit availability","lf"),("Stop looking","stop")))
-    await i.response.send_modal(Form("Looking for a seat",[field("Available hours from now","1.5"),comment()],save))
+    await i.response.send_modal(Form("Looking for a seat",[
+        field("How long are you available for?","Hours you can play after starting, e.g. 2"),
+        field("How long from now are you available?","Hours until you can start: 0 = now, 0.5 = 30 min","0"),
+        comment()],save))
 
-@tree.command(description="Tell the guild how long you can grind on your role maps")
+@tree.command(description="Tell the guild when you can start and how long you can grind")
 async def lf(i:discord.Interaction):
     guard(i)
     await lf_form(i)
@@ -544,15 +563,16 @@ async def claim_form(i,gid):
             is_sub=j.user.id in registered_subs(g,t)
             if s["id"]>0 and j.guild_id!=TEST_GUILD and not is_sub and maprow(s["map"])["role"] not in roles(j.user):
                 raise Rule("You need the map role or a sub registration for this shift.")
-            end=g["b"] if not duration else max(t,g["a"])+hours(duration)
+            start=max(t,g["a"],listed[0]["starts"] if listed else 0)
+            end=g["b"] if not duration else start+hours(duration)
             if listed: end=min(end,listed[0]["until"])
-            a,b=db.claim(gid,j.user.id,t,end,note)
+            a,b=db.claim(gid,j.user.id,t,end,note,starts=start)
         await reply(j,f"You have seat {g['seat']} for {span(a,b)} · {clean(note)}.")
     av=db.rows("select * from lf where user=? and until>?",i.user.id,now())
     prefs=db.rows("select note from subs where shift=? and user=?",s["id"],i.user.id)
     default=av[0]["note"] if av else prefs[0]["note"] if prefs else ""
     await i.response.send_modal(Form("Claim seat "+str(g["seat"]),[
-        field("Hours from handoff (blank = all available)","E.g. 0.5 for half an hour","",False),comment(default)],save))
+        field("How long are you available for?","Hours from your start; blank = all available","",False),comment(default)],save))
 
 async def dispatch(i,cmd,p):
     uid=i.user.id
@@ -560,7 +580,7 @@ async def dispatch(i,cmd,p):
     if cmd=="absent": return await absence_form(i,*map(int,p))
     if cmd=="lfmatches": return await lf_matches(i,int(p[1]))
     if cmd.startswith("practice_"): return await practice_form(i,int(p[0]),cmd[9:])
-    if cmd=="overview": return await overview(i,p[0],int(p[1]),int(p[2]) if len(p)>2 else None)
+    if cmd=="overview": return await overview(i,p[0],int(p[1]),int(p[2]) if len(p)>2 else None,int(p[3]) if len(p)>3 else 1)
     if cmd=="zones": return await zone_prompt(i)
     if cmd=="zone": return await choose_zone(i,p[0])
     if cmd=="lf": return await lf_form(i)
@@ -633,7 +653,7 @@ async def dispatch(i,cmd,p):
         for av in db.rows("select * from lf where until>? order by until",now()):
             member=i.guild.get_member(av["user"])
             if member and m["role"] in roles(member):
-                lines.append(f"{mention(member.id)} · until {stamp(av['until'])} · {clean(av['note'])}")
+                lines.append(f"{mention(member.id)} · {span(max(now(),av['starts']),av['until'])} · {clean(av['note'])}")
         return await list_text(i,f"**{m['name']} · looking for a seat**",lines or ["Nobody currently listed."])
 
 @client.event
@@ -687,9 +707,10 @@ def recipients(guild,g,mode,t):
             if sid<0 or db.available(user,a,min(g["b"],a+1)):
                 candidates.add(user)
     if mode=="lf" or (mode=="open" and g["stage"]):
-        for row in db.rows("select * from lf where until>?",a):
+        for row in db.rows("select * from lf where until>? and starts<?",a,g["b"]):
             member=guild.get_member(row["user"])
-            if member and rid in roles(member) and db.available(member.id,a,min(row["until"],g["b"])):
+            start=max(a,row["starts"])
+            if member and rid in roles(member) and db.available(member.id,start,min(row["until"],g["b"])):
                 candidates.add(member.id)
     candidates.discard(g["owner"])
     return sorted(candidates)
